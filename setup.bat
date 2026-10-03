@@ -11,5 +11,5 @@ if errorlevel 1 (
   exit /b 1
 )
 
-%PYTHON_CMD% setup.py %*
+%PYTHON_CMD% "%~dp0setup.py" %*
 exit /b %ERRORLEVEL%

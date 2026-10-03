@@ -1,0 +1,62 @@
+name: Pinball checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            e2e/package-lock.json
+      - name: Source credential audit
+        run: python tools/check_secrets.py
+      - name: Setup
+        run: python setup.py
+      - name: Backend and launcher checks (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          .venv/Scripts/python.exe -m unittest discover -s backend/tests -v
+          .venv/Scripts/python.exe -m unittest discover -s tests -v
+      - name: Backend and launcher checks (Linux)
+        if: runner.os != 'Windows'
+        run: |
+          .venv/bin/python -m unittest discover -s backend/tests -v
+          .venv/bin/python -m unittest discover -s tests -v
+      - name: Original engine regression checks
+        run: node --test original-project/tests/*.test.mjs
+      - name: Frontend typecheck and production build
+        working-directory: frontend
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+      - name: Install test browser
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+      - name: Browser checks
+        working-directory: e2e
+        run: |
+          npm run typecheck
+          npm test
+      - name: Browser reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-${{ matrix.os }}
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/

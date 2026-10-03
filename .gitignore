@@ -229,5 +229,13 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-original_project
-original-project
+# Preserve the legacy source; only ignore generated dependencies/artifacts.
+**/node_modules/
+**/.artifacts/
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.tsbuildinfo

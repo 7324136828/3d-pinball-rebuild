@@ -1,5 +1,5 @@
 {
-  "name": "sample-react-python-e2e",
+  "name": "modern-3d-pinball-e2e",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -7,7 +7,8 @@
     "test": "playwright test",
     "test:headed": "playwright test --headed",
     "typecheck": "tsc --noEmit",
-    "install:webkit": "playwright install webkit"
+    "install:webkit": "playwright install webkit",
+    "install:chromium": "playwright install chromium"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",
