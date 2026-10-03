@@ -1,0 +1,1 @@
+"""API schemas for pinball sessions and rankings."""
