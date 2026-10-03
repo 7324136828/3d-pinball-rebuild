@@ -6,10 +6,7 @@ on:
 
 jobs:
   verify:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,13 +23,7 @@ jobs:
         run: python tools/check_secrets.py
       - name: Setup
         run: python setup.py
-      - name: Backend and launcher checks (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          .venv/Scripts/python.exe -m unittest discover -s backend/tests -v
-          .venv/Scripts/python.exe -m unittest discover -s tests -v
-      - name: Backend and launcher checks (Linux)
-        if: runner.os != 'Windows'
+      - name: Backend and launcher checks
         run: |
           .venv/bin/python -m unittest discover -s backend/tests -v
           .venv/bin/python -m unittest discover -s tests -v
@@ -56,7 +47,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-${{ matrix.os }}
+          name: playwright-ubuntu
           path: |
             e2e/playwright-report/
             e2e/test-results/

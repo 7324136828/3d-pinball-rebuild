@@ -202,7 +202,7 @@ The local productionization standard's PDF uploads, conversion ZIPs, and scratch
 job directories are specific to converters. This game has no upload/conversion
 pipeline. Durable ranking data belongs in SQLite; temporary test databases use
 the operating system temp folder. A repeatable source credential audit is in
-`secrets.md`. The CI workflow validates both Windows and Linux.
+`secrets.md`. The CI workflow runs on Ubuntu.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the preserved source's
 [provenance](original-project/PROVENANCE.md) for engine and table attribution.
