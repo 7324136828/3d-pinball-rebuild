@@ -15,6 +15,9 @@ import sys
 import time
 from pathlib import Path
 
+from backend.network import lan_urls_for_host
+from backend.settings import SettingsError, initialize_port_settings, settings_path
+
 ROOT = Path(__file__).resolve().parent
 FRONTEND = ROOT / "frontend"
 LOCAL_PYTHON = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -67,6 +70,8 @@ def select_runtime() -> Path:
 
 
 def parse_port(value: str | int, label: str) -> int:
+    if isinstance(value, bool) or isinstance(value, float):
+        raise RunError(f"{label} must be an integer")
     try:
         port = int(value)
     except (TypeError, ValueError) as error:
@@ -88,6 +93,8 @@ def available_port(start: int, reserved: set[int] | None = None, host: str = "12
         endpoint = (address[0], port, *address[2:])
         with socket.socket(family, socket.SOCK_STREAM) as probe:
             try:
+                if os.name == "nt":
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
                 probe.bind(endpoint)
             except OSError as error:
                 if error.errno in (errno.EADDRINUSE, errno.EACCES) or getattr(error, "winerror", None) in (10013, 10048):
@@ -97,12 +104,11 @@ def available_port(start: int, reserved: set[int] | None = None, host: str = "12
     raise RunError(f"No available TCP port at or above {start}")
 
 
-def merge_cors_origins(environment: dict[str, str], frontend_port: int) -> None:
+def merge_cors_origins(environment: dict[str, str], frontend_port: int, extra_origins: list[str] | None = None) -> None:
     origins = [value.strip() for value in environment.get("CORS_ORIGINS", "").split(",") if value.strip()]
     if "*" in origins:
         return
-    for hostname in ("localhost", "127.0.0.1"):
-        origin = f"http://{hostname}:{frontend_port}"
+    for origin in (f"http://localhost:{frontend_port}", f"http://127.0.0.1:{frontend_port}", *(extra_origins or [])):
         if origin not in origins:
             origins.append(origin)
     environment["CORS_ORIGINS"] = ",".join(origins)
@@ -216,21 +222,35 @@ class ManagedProcess:
                 self.job.close()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--production", action="store_true", help="build React and serve it with the API on one port")
-    parser.add_argument("--backend-port", type=int, help="first API/server port to try")
-    parser.add_argument("--frontend-port", type=int, help="first Vite port to try (development only)")
-    parser.add_argument("--host", help="API/server bind address (default: 127.0.0.1)")
+    parser.add_argument("--backend", "--backend-port", dest="backend_port", type=int, help="first API/server port to try")
+    parser.add_argument("--frontend", "--frontend-port", dest="frontend_port", type=int, help="first Vite port to try (development only)")
+    parser.add_argument("--host", help="bind address for both services (default: BACKEND_HOST or 0.0.0.0)")
     parser.add_argument("--no-reload", action="store_true", help="disable API development reload")
-    return parser.parse_args()
+    parser.add_argument("--initialize-settings", action="store_true", help=argparse.SUPPRESS)
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        ports = initialize_port_settings(ROOT / "port_mapping.json")
+    except SettingsError as error:
+        raise RunError(str(error)) from error
+    if args.initialize_settings:
+        return 0
     load_env_file()
-    requested_backend = parse_port(args.backend_port if args.backend_port is not None else os.environ.get("BACKEND_PORT", "8000"), "backend port")
-    host = args.host or os.environ.get("BACKEND_HOST", "127.0.0.1")
+    requested_backend = parse_port(args.backend_port if args.backend_port is not None else os.environ.get("BACKEND_PORT", ports["backend_port"]), "backend port")
+    requested_frontend = parse_port(args.frontend_port if args.frontend_port is not None else os.environ.get("FRONTEND_PORT", ports["frontend_port"]), "frontend port")
+    if requested_frontend == requested_backend:
+        raise RunError("Frontend and backend ports must be different")
+    requested_host = args.host or os.environ.get("BACKEND_HOST", "0.0.0.0")
+    try:
+        host = socket.getaddrinfo(requested_host, 0, type=socket.SOCK_STREAM)[0][4][0]
+    except OSError as error:
+        raise RunError(f"Cannot resolve bind host {requested_host}") from error
     backend_port = available_port(requested_backend, host=host)
     connect_host = "127.0.0.1" if host in ("0.0.0.0", "localhost") else "::1" if host == "::" else host
     backend_url = f"http://{'[' + connect_host + ']' if ':' in connect_host else connect_host}:{backend_port}"
@@ -239,7 +259,6 @@ def main() -> int:
     if npm is None or not (FRONTEND / "node_modules").is_dir():
         raise RunError("Frontend dependencies or npm are missing; run setup first")
     environment = os.environ.copy()
-    environment.setdefault("PINBALL_DB_PATH", "data/pinball.db")
     environment["PYTHONUNBUFFERED"] = "1"
     frontend_environment = environment.copy()
     frontend_environment["BACKEND_URL"] = backend_url
@@ -266,19 +285,25 @@ def main() -> int:
                 raise RunError(f"Frontend build failed with exit code {status}")
             environment["PINBALL_STATIC_DIR"] = str(FRONTEND / "dist")
             print(f"[run] Modern 3D Pinball: {backend_url} (API docs: {backend_url}/docs)", flush=True)
+            for url in lan_urls_for_host(host, backend_port):
+                print(f"[run] LAN: {url} (API docs: {url}/docs)", flush=True)
         else:
-            requested_frontend = parse_port(args.frontend_port if args.frontend_port is not None else os.environ.get("FRONTEND_PORT", "5173"), "frontend port")
-            frontend_port = available_port(requested_frontend, {backend_port})
-            merge_cors_origins(environment, frontend_port)
+            frontend_port = available_port(requested_frontend, {backend_port}, host=host)
+            frontend_url = f"http://{'[' + connect_host + ']' if ':' in connect_host else connect_host}:{frontend_port}"
+            frontend_lan_urls = lan_urls_for_host(host, frontend_port)
+            merge_cors_origins(environment, frontend_port, [frontend_url, *frontend_lan_urls])
             if not args.no_reload:
                 backend_command.append("--reload")
             if frontend_port != requested_frontend:
                 print(f"[run] Frontend port {requested_frontend} is busy; using {frontend_port}.", flush=True)
-            print(f"[run] Modern 3D Pinball: http://localhost:{frontend_port}\n[run] API: {backend_url} (docs: {backend_url}/docs)", flush=True)
+            print(f"[run] Modern 3D Pinball: {frontend_url}\n[run] API: {backend_url} (docs: {backend_url}/docs)", flush=True)
+            for frontend_url, api_url in zip(frontend_lan_urls, lan_urls_for_host(host, backend_port)):
+                print(f"[run] LAN: {frontend_url}\n[run] LAN API: {api_url}/docs", flush=True)
+        print(f"[run] Settings: {settings_path()}", flush=True)
         print("[run] Press Ctrl+C to stop all services.", flush=True)
         services.append(ManagedProcess("Backend", backend_command, cwd=ROOT, env=environment))
         if not args.production:
-            services.append(ManagedProcess("Frontend", [npm, "run", "dev", "--", "--host", "127.0.0.1", "--port", str(frontend_port), "--strictPort"], cwd=FRONTEND, env=frontend_environment))
+            services.append(ManagedProcess("Frontend", [npm, "run", "dev", "--", "--host", host, "--port", str(frontend_port), "--strictPort"], cwd=FRONTEND, env=frontend_environment))
         while True:
             for service in services:
                 assert service.process is not None

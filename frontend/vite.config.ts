@@ -6,7 +6,7 @@ const backendUrl = process.env.BACKEND_URL || process.env.VITE_BACKEND_URL || 'h
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: '127.0.0.1',
+    host: process.env.BACKEND_HOST || '0.0.0.0',
     port: 5173,
     proxy: {
       '/api': {
@@ -15,6 +15,6 @@ export default defineConfig({
       },
     },
   },
-  preview: { host: '127.0.0.1' },
+  preview: { host: process.env.BACKEND_HOST || '0.0.0.0' },
   build: { rollupOptions: { output: { manualChunks: { three: ['three'] } } } },
 });

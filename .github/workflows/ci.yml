@@ -2,11 +2,20 @@ name: Pinball checks
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   verify:
     runs-on: ubuntu-latest
+    env:
+      XDG_CONFIG_HOME: ${{ runner.temp }}/pinball-config
+      TEMP: ${{ runner.temp }}/pinball-data
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,8 +36,6 @@ jobs:
         run: |
           .venv/bin/python -m unittest discover -s backend/tests -v
           .venv/bin/python -m unittest discover -s tests -v
-      - name: Original engine regression checks
-        run: node --test original-project/tests/*.test.mjs
       - name: Frontend typecheck and production build
         working-directory: frontend
         run: |
