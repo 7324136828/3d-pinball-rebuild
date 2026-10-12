@@ -17,7 +17,8 @@ class UserSettingsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="pinball-settings-test-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # Windows runners may spell TEMP with an 8.3 alias (e.g. RUNNER~1).
+        self.root = Path(self.temporary.name).resolve()
         self.config = self.root / "config" / "settings.json"
         self.mapping = self.root / "port_mapping.json"
         self.mapping.write_text('{"frontend": 3010, "backend": 3020}', encoding="utf-8")
@@ -138,7 +139,7 @@ class UserSettingsTests(unittest.TestCase):
 class SettingsLocationTests(unittest.TestCase):
     def test_configuration_and_default_storage_locations_use_os_environment(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pinball-locations-test-") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             with patch.dict(os.environ, {"APPDATA": str(root / "roaming"), "XDG_CONFIG_HOME": str(root / "xdg"), "TEMP": str(root / "temp")}, clear=True):
                 expected_config = root / ("roaming" if os.name == "nt" else "xdg") / settings.APP_NAME / "settings.json"
                 self.assertEqual(settings.settings_path(), expected_config)
