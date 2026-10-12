@@ -136,11 +136,18 @@ support the same overrides as the source launcher. Rebuilding replaces generated
 artifacts while preserving each distribution's `.env` and data files.
 
 GitHub Actions runs checks and builds both Windows profiles on every push to
-`main` (including merged pull requests), and can be started manually. Download
-the Debug and Release ZIPs, with SHA-256 checksums, from the build run's
-`3d-pinball-rebuild-windows-x64-<run_number>` artifact. Builds are available as
-workflow artifacts; they are not automatically
-published as GitHub Releases.
+`main` (including merged pull requests), and can be started manually. After the
+build and smoke tests pass on `main`, it publishes a
+[GitHub Release](https://github.com/7324136828/3d-pinball-rebuild/releases)
+tagged `windows-build-<run_number>`, with Debug and Release ZIPs and
+`SHA256SUMS.txt`. The release is marked Latest and its link appears in the
+workflow summary. Publication uses the workflow's `GITHUB_TOKEN`; no extra
+secret is required. Failed uploads leave a draft that a retry can finish;
+retrying an already published run reuses its existing release.
+The workflow checks that the release is published and that all three downloads
+are present before reporting success.
+The same downloads are also available in the workflow's
+`3d-pinball-rebuild-windows-x64-<run_number>` artifact.
 
 ## Source production server
 
@@ -314,8 +321,9 @@ the operating system temp folder. A repeatable source credential audit is in
 - Pinball adds table assets, multiplayer sessions, ranking persistence, game
   validation, a session lifetime, and browser regression checks instead of the
   sample's counter. Both expose an unauthenticated API for use on a trusted LAN.
-- The sample also publishes GitHub Releases. This workflow provides Debug/Release
-  build artifacts on `main` and manual runs.
+- Like the sample, successful builds on `main` publish GitHub Releases with
+  Debug/Release ZIPs and checksums. Tags use the workflow run number so retries
+  reuse the same release.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the adapted engine's
 [provenance](frontend/src/pinball/PROVENANCE.md) for engine and table attribution.
