@@ -436,7 +436,7 @@ class PackagedSmokeTests(unittest.TestCase):
         opener = build_opener(ProxyHandler({}))
         for profile in PROFILES:
             with self.subTest(profile=profile), tempfile.TemporaryDirectory(prefix="pinball-frozen-") as directory:
-                isolated = Path(directory)
+                isolated = Path(directory).resolve()
                 temporary = isolated / "temp"
                 temporary.mkdir()
                 environment = os.environ.copy()
