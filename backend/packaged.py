@@ -1,0 +1,391 @@
+"""Run the portable backend and built frontend from one executable."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import signal
+import socket
+import sys
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
+from typing import Iterator
+from urllib.parse import urlsplit
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, Request
+from starlette.datastructures import Headers
+from starlette.responses import JSONResponse, Response
+from starlette.staticfiles import StaticFiles
+
+HOP_BY_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade",
+}
+
+
+class RunError(RuntimeError):
+    """Raised when the portable application cannot start or keep running."""
+
+
+def runtime_directory() -> Path:
+    # A one-file executable extracts its Python modules to a temporary directory.
+    # Public files belong beside server.exe, outside that directory.
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1] / "dist"
+
+
+def load_environment(root: Path) -> None:
+    """Load literal values beside the executable; process variables take priority."""
+    env_file = root / ".env"
+    if env_file.is_file():
+        for number, raw_line in enumerate(env_file.read_text(encoding="utf-8-sig").splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, separator, value = line.partition("=")
+            key = key.strip()
+            if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise RunError(f"Invalid .env assignment on line {number}")
+            value = value.strip()
+            if value.startswith(("'", '"')):
+                quote = value[0]
+                end = value.find(quote, 1)
+                remainder = value[end + 1:].strip() if end >= 0 else ""
+                if end < 0 or (remainder and not remainder.startswith("#")):
+                    raise RunError(f"Invalid quoted .env value on line {number}")
+                value = value[1:end]
+            else:
+                value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+            os.environ.setdefault(key, value)
+
+    configured = os.environ.get("PINBALL_DB_PATH")
+    if configured and configured.strip():
+        database = Path(os.path.expandvars(configured)).expanduser()
+        if not database.is_absolute():
+            database = root / database
+        os.environ["PINBALL_DB_PATH"] = str(database.resolve())
+    elif configured is not None:
+        os.environ.pop("PINBALL_DB_PATH")
+
+
+def runtime_host(root: Path) -> str:
+    profile_path = root / "runtime.json"
+    if not profile_path.exists():
+        return "0.0.0.0"
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RunError(f"Cannot read runtime profile at {profile_path}: {error}") from error
+    if not isinstance(profile, dict) or profile.get("host") not in ("127.0.0.1", "0.0.0.0"):
+        raise RunError(
+            f"Invalid runtime profile at {profile_path}: host must be 127.0.0.1 or 0.0.0.0"
+        )
+    return profile["host"]
+
+
+def port_number(value: str | int) -> int:
+    if type(value) not in (str, int):
+        raise argparse.ArgumentTypeError("port must be an integer")
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("port must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def parse_args(
+    argv: list[str] | None = None, *, default_host: str = "0.0.0.0",
+    defaults_path: Path | None = None,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--frontend", "--frontend-port", dest="frontend_port", type=port_number,
+        help="frontend port (default: FRONTEND_PORT or settings.json)",
+    )
+    parser.add_argument(
+        "--backend", "--backend-port", dest="backend_port", type=port_number,
+        help="backend port (default: BACKEND_PORT or settings.json)",
+    )
+    parser.add_argument(
+        "--host", default=os.environ.get("BACKEND_HOST", default_host),
+        help="bind address for both services (default: BACKEND_HOST or runtime profile)",
+    )
+    parser.add_argument("--initialize-settings", action="store_true", help=argparse.SUPPRESS)
+    options = parser.parse_args(argv)
+    defaults = {"frontend_port": 3010, "backend_port": 3020}
+    if defaults_path is not None:
+        from backend.settings import SettingsError, initialize_port_settings
+
+        try:
+            defaults = initialize_port_settings(defaults_path)
+        except SettingsError as error:
+            raise RunError(str(error)) from error
+    if options.initialize_settings:
+        return options
+    for field, variable in (("frontend_port", "FRONTEND_PORT"), ("backend_port", "BACKEND_PORT")):
+        value = getattr(options, field)
+        if value is None:
+            value = os.environ.get(variable, defaults[field])
+        try:
+            setattr(options, field, port_number(value))
+        except argparse.ArgumentTypeError as error:
+            parser.error(f"{field}: {error}")
+    if options.frontend_port == options.backend_port:
+        parser.error("frontend and backend ports must be different")
+    return options
+
+
+def bind_listener(host: str, port: int, label: str) -> socket.socket:
+    """Reserve the requested port before starting either application."""
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as error:
+        raise RunError(f"Cannot resolve bind address {host!r}: {error}") from error
+    last_error: OSError | None = None
+    for family, kind, protocol, _, address in addresses:
+        listener = socket.socket(family, kind, protocol)
+        try:
+            if os.name == "nt":
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(address)
+            listener.listen(socket.SOMAXCONN)
+            listener.setblocking(False)
+            return listener
+        except OSError as error:
+            listener.close()
+            last_error = error
+    raise RunError(
+        f"Cannot bind {label} to {host}:{port}; choose another port or close "
+        f"the service using it. {last_error}"
+    ) from last_error
+
+
+def listener_url(listener: socket.socket) -> str:
+    host, port = listener.getsockname()[:2]
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
+
+
+def forwarded_headers(
+    headers: httpx.Headers | Headers, *, response: bool = False,
+) -> list[tuple[bytes, bytes]]:
+    # Repeated Connection fields are permitted; every named header is private
+    # to that hop, including tokens in later occurrences of the field.
+    excluded = HOP_BY_HOP_HEADERS | {
+        item.strip().lower()
+        for key, value in headers.raw if key.decode("latin-1").lower() == "connection"
+        for item in value.decode("latin-1").split(",")
+    }
+    # HTTPX decodes response bodies; let Response compute their new length.
+    excluded |= {"host", "content-length"}
+    if response:
+        excluded.add("content-encoding")
+    return [(key, value) for key, value in headers.raw
+            if key.decode("latin-1").lower() not in excluded]
+
+
+def create_frontend_app(public: Path, backend_url: str) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        # Local traffic must not depend on the target machine's HTTP proxy setup.
+        async with httpx.AsyncClient(
+            base_url=backend_url, trust_env=False, timeout=30.0,
+        ) as client:
+            application.state.backend_client = client
+            yield
+
+    application = FastAPI(
+        docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan,
+    )
+
+    async def proxy(request: Request) -> Response:
+        # Preserve percent escapes: decoding a path such as /api/a%3Fb would
+        # otherwise turn its embedded question mark into an upstream query.
+        raw_path = request.scope.get("raw_path", request.url.path.encode("utf-8"))
+        if request.scope["query_string"]:
+            raw_path += b"?" + request.scope["query_string"]
+        upstream_url = request.app.state.backend_client.base_url.copy_with(raw_path=raw_path)
+        try:
+            upstream = await request.app.state.backend_client.request(
+                request.method, upstream_url, content=await request.body(),
+                headers=forwarded_headers(request.headers),
+            )
+        except httpx.RequestError:
+            return JSONResponse({"detail": "Backend is unavailable"}, status_code=502)
+        response = Response(content=upstream.content, status_code=upstream.status_code)
+        response.raw_headers = forwarded_headers(upstream.headers, response=True)
+        if request.method != "HEAD" and upstream.status_code not in (204, 304):
+            response.raw_headers.append((b"content-length", str(len(upstream.content)).encode("ascii")))
+        return response
+
+    methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    application.add_api_route("/api", proxy, methods=methods)
+    application.add_api_route("/api/{path:path}", proxy, methods=methods)
+    application.mount("/", StaticFiles(directory=public, html=True), name="public")
+    return application
+
+
+class ManagedServer(uvicorn.Server):
+    """Two listeners share one process-level signal handler."""
+
+    @contextmanager
+    def capture_signals(self) -> Iterator[None]:
+        yield
+
+    def install_signal_handlers(self) -> None:
+        # Compatibility with Uvicorn releases before capture_signals was added.
+        pass
+
+
+async def serve_applications(
+    backend: FastAPI, frontend: FastAPI,
+    backend_socket: socket.socket, frontend_socket: socket.socket,
+) -> int:
+    servers = [
+        ManagedServer(uvicorn.Config(
+            application, loop="asyncio", http="h11", ws="none", lifespan="on",
+            access_log=False, use_colors=False, timeout_graceful_shutdown=5,
+        ))
+        for application in (backend, frontend)
+    ]
+    stopping = False
+
+    def stop_services(signum: int, frame: object) -> None:
+        nonlocal stopping
+        for server in servers:
+            server.should_exit = True
+            if stopping:
+                server.force_exit = True
+        if not stopping:
+            print("\n[run] Stopping both services...", flush=True)
+        stopping = True
+
+    async def serve(server: ManagedServer, listener: socket.socket, label: str) -> None:
+        try:
+            await server.serve(sockets=[listener])
+        except SystemExit as error:
+            # Keep startup failure inside this task so its sibling can shut down.
+            raise RunError(f"{label} failed to start (exit code {error.code})") from error
+
+    signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGBREAK"):
+        signals.append(signal.SIGBREAK)
+    previous = {item: signal.signal(item, stop_services) for item in signals}
+    tasks = [
+        asyncio.create_task(serve(server, listener, label))
+        for server, listener, label in zip(
+            servers, (backend_socket, frontend_socket), ("Backend", "Frontend"),
+        )
+    ]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for server in servers:
+            server.should_exit = True
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for item, handler in previous.items():
+            signal.signal(item, handler)
+    for label, result in zip(("Backend", "Frontend"), results):
+        if isinstance(result, BaseException):
+            raise RunError(f"{label} failed: {result}") from result
+    if not stopping:
+        raise RunError("A service stopped unexpectedly; both services have been stopped")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    root = runtime_directory()
+    load_environment(root)
+    if not getattr(sys, "frozen", False):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    options = parse_args(
+        argv, default_host=runtime_host(root), defaults_path=root / "port_mapping.json",
+    )
+    if options.initialize_settings:
+        return 0
+    public = root / "public"
+    if not (public / "index.html").is_file():
+        raise RunError(f"Frontend is missing at {public}; rebuild with build.bat")
+
+    backend_socket = bind_listener(options.host, options.backend_port, "backend")
+    frontend_socket: socket.socket | None = None
+    try:
+        frontend_socket = bind_listener(options.host, options.frontend_port, "frontend")
+        # The bundled geometry lives beside server.exe, outside PyInstaller's
+        # temporary extraction directory. Set this before constructing the app.
+        os.environ["PINBALL_TABLE_PATH"] = str(root / "assets" / "table.json")
+        from backend.network import lan_urls
+        from backend.settings import SettingsError, configured_database_path, settings_path
+
+        try:
+            database = configured_database_path(root)
+        except SettingsError as error:
+            raise RunError(str(error)) from error
+        try:
+            ttl = int(os.environ.get("PINBALL_SESSION_TTL_SECONDS", "86400"))
+        except ValueError as error:
+            raise RunError("PINBALL_SESSION_TTL_SECONDS must be an integer") from error
+        if not 60 <= ttl <= 604800:
+            raise RunError("PINBALL_SESSION_TTL_SECONDS must be between 60 and 604800")
+        from backend.app.config import Settings
+        from backend.app.main import create_app
+
+        origins = os.environ.get("CORS_ORIGINS", "")
+        app = create_app(settings=Settings(
+            database_path=database,
+            cors_origins=tuple(origin.strip() for origin in origins.split(",") if origin.strip()),
+            session_ttl_seconds=ttl,
+            static_dir=None,
+        ))
+
+        backend_url = listener_url(backend_socket)
+        frontend_url = listener_url(frontend_socket)
+        frontend = create_frontend_app(public, backend_url)
+        print("Starting Modern 3D Pinball Services")
+        print(f"Python:   {sys.executable}")
+        print(f"Backend:  {backend_url} (API docs: {backend_url}/docs)")
+        print(f"Frontend: {frontend_url}")
+        backend_lan_urls = {urlsplit(url).hostname: url for url in lan_urls(backend_socket)}
+        frontend_lan_urls = lan_urls(frontend_socket)
+        for url in frontend_lan_urls:
+            print(f"LAN:      {url}")
+            api_url = backend_lan_urls.get(urlsplit(url).hostname)
+            if api_url is not None:
+                print(f"LAN API:  {api_url}/docs")
+        if frontend_lan_urls:
+            print("Open a LAN URL on another device connected to the same network.")
+        print(f"Settings: {settings_path()}")
+        print(f"Database: {database}")
+        print("[run] Press Ctrl+C to stop both services.", flush=True)
+        return asyncio.run(serve_applications(app, frontend, backend_socket, frontend_socket))
+    finally:
+        if frontend_socket is not None:
+            frontend_socket.close()
+        backend_socket.close()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(0)
+    except (RunError, OSError) as error:
+        print(f"[run] ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)

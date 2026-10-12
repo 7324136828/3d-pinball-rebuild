@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-EXCLUDED = {".git", ".venv", "node_modules", "__pycache__", "dist", "test-results", "playwright-report", ".artifacts"}
+EXCLUDED = {".git", ".venv", "node_modules", "__pycache__", "build", "dist", "test-results", "playwright-report", ".artifacts"}
 PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
     "AWS access key": re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),

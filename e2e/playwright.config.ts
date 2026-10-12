@@ -19,8 +19,17 @@ const python = existsSync(localPython)
     : isWindows
       ? 'python'
       : 'python3';
-const backendUrl = 'http://127.0.0.1:8001';
-const frontendUrl = 'http://127.0.0.1:5174';
+function testPort(variable: string, fallback: number): number {
+  const value = process.env[variable];
+  const port = value === undefined ? fallback : Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${variable} must be a port from 1 to 65535`);
+  return port;
+}
+const backendPort = testPort('PINBALL_E2E_BACKEND_PORT', 8001);
+const frontendPort = testPort('PINBALL_E2E_FRONTEND_PORT', 5174);
+if (frontendPort === backendPort) throw new Error('Browser-test frontend and backend ports must be different');
+const backendUrl = `http://127.0.0.1:${backendPort}`;
+const frontendUrl = `http://127.0.0.1:${frontendPort}`;
 // Use a unique system-temp database rather than the user's rankings.
 const temporaryRoot = process.env.PINBALL_E2E_TEMP || mkdtempSync(join(tmpdir(), 'pinball-e2e-'));
 process.env.PINBALL_E2E_TEMP = temporaryRoot;
@@ -63,7 +72,7 @@ export default defineConfig({
       ],
   webServer: [
     {
-      command: `"${python}" -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8001`,
+      command: `"${python}" -m uvicorn backend.app.main:app --host 127.0.0.1 --port ${backendPort}`,
       cwd: projectRoot,
       env: {
         ...environment,
@@ -75,7 +84,7 @@ export default defineConfig({
       reuseExistingServer: false,
     },
     {
-      command: `${isWindows ? 'npm.cmd' : 'npm'} run dev -- --host 127.0.0.1 --port 5174 --strictPort`,
+      command: `${isWindows ? 'npm.cmd' : 'npm'} run dev -- --host 127.0.0.1 --port ${frontendPort} --strictPort`,
       cwd: frontendRoot,
       env: {
         ...environment,

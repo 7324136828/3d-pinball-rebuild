@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from ..config import PROJECT_ROOT
@@ -16,7 +17,8 @@ from ..config import PROJECT_ROOT
 
 class OriginalProjectAdapter:
     def __init__(self, table_path: Path | None = None):
-        self.table_path = table_path or PROJECT_ROOT / "assets" / "table.json"
+        configured = os.environ.get("PINBALL_TABLE_PATH")
+        self.table_path = table_path or (Path(configured) if configured else PROJECT_ROOT / "assets" / "table.json")
         self.table_bytes = b""
         self.etag = ""
 

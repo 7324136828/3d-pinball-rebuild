@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from backend.settings import configured_database_path
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MAX_SCORE = 9_007_199_254_740_991  # JavaScript's largest exact integer; fits SQLite int64.
 MAX_DURATION_MS = 604_800_000  # Seven days, matching the maximum configurable session TTL.
@@ -31,7 +33,7 @@ class Settings:
         static_dir = os.environ.get("PINBALL_STATIC_DIR", "").strip()
         origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
         return cls(
-            database_path=project_path(os.environ.get("PINBALL_DB_PATH", "data/pinball.db")),
+            database_path=configured_database_path(PROJECT_ROOT),
             cors_origins=tuple(origin.strip() for origin in origins.split(",") if origin.strip()),
             session_ttl_seconds=ttl,
             static_dir=project_path(static_dir) if static_dir else None,
